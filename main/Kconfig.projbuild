@@ -413,6 +413,9 @@ choice BOARD_TYPE
     config BOARD_TYPE_OTTO_ROBOT
         bool "Otto Robot"
         depends on IDF_TARGET_ESP32S3
+    config BOARD_TYPE_MICRODUCK_XIAOZHI
+        bool "Microduck Xiaozhi"
+        depends on IDF_TARGET_ESP32S3
     config BOARD_TYPE_QUANDONG_S3_DEV
         bool "Quandong ESP32-S3 Development Board (全动)"
         depends on IDF_TARGET_ESP32S3
