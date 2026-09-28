@@ -22,6 +22,10 @@
 
 class OttoController {
 private:
+    // 允许文件作用域的 OttoQueueAction 桥接函数访问私有 QueueAction，
+    // 这样触摸任务等外部上下文就能把动作投递到主动作队列。
+    friend void OttoQueueAction(int, int, int, int, int);
+    // ...existing private members...
     Otto otto_;
     TaskHandle_t action_task_handle_ = nullptr;
     QueueHandle_t action_queue_;
@@ -1108,5 +1112,14 @@ void InitializeOttoController(const HardwareConfig& hw_config) {
     if (g_otto_controller == nullptr) {
         g_otto_controller = new OttoController(hw_config);
         ESP_LOGI(TAG, "Otto控制器已初始化并注册MCP工具");
+    }
+}
+
+// 供触摸任务等外部上下文调用，把动作投递到主动作队列
+// action_type 取 ActionType 枚举值（如 52 = ACTION_DUCK_SHAKE_HEAD）
+void OttoQueueAction(int action_type, int steps, int speed,
+                     int direction, int amount) {
+    if (g_otto_controller) {
+        g_otto_controller->QueueAction(action_type, steps, speed, direction, amount);
     }
 }

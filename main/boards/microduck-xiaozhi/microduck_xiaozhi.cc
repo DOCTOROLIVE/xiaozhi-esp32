@@ -26,7 +26,182 @@
 
 #define TAG "MicroduckXiaozhi"
 
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+// ESP-IDF v6.x 新触摸驱动（handle-based），替代已废弃的 legacy touch_pad.h
+#include "driver/touch_sens.h"
+
 extern void InitializeOttoController(const HardwareConfig& hw_config);
+extern void OttoQueueAction(int action_type, int steps, int speed,
+                            int direction, int amount);
+
+// 触摸任务：GPIO13（TOUCH_PAD_NUM12）检测到触摸 → 投递 ACTION_DUCK_SHAKE_HEAD
+//
+// 关键点：
+// 1. 启动后必须等待 3 秒再测基线：舵机/WiFi/音频等外设上电后会改变触摸传感器的
+//    电气环境，启动期的读数不能代表稳态基线。
+// 2. 无条件滚动基线：始终缓慢跟踪当前 SMOOTH 值以吸收温漂/上电漂移；
+//    超过阈值时改用更慢的比率，既不影响一次 1~2 秒的真实触摸，又能吸收持续性漂移。
+// 3. 边沿触发：只有"回落到阈值以下重新武装"后才允许再次触发，
+//    避免环境长期偏移导致每 3 秒重复触发。
+// 4. 3 帧连续确认 + 3 秒冷却窗口，防止单点噪声误触发。
+static void TouchHeadShakeTask(void* arg) {
+    // ---- 新驱动（touch_sens.h, ESP32-S3 = Touch HW V2）初始化 ----
+    // 采样配置：charge_times 决定读数大小（数据与 charge_times 正相关），
+    // 电压摆幅取最大 2V7→0V5 以提高小电极灵敏度
+    touch_sensor_sample_config_t sample_cfg = TOUCH_SENSOR_V2_DEFAULT_SAMPLE_CONFIG(
+        1000, TOUCH_VOLT_LIM_L_0V5, TOUCH_VOLT_LIM_H_2V7);
+    touch_sensor_config_t sens_cfg = TOUCH_SENSOR_DEFAULT_BASIC_CONFIG(1, &sample_cfg);
+
+    touch_sensor_handle_t sens_handle = nullptr;
+    esp_err_t err = touch_sensor_new_controller(&sens_cfg, &sens_handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "触摸控制器创建失败: %s", esp_err_to_name(err));
+        vTaskDelete(nullptr);
+        return;
+    }
+
+    // 通道 12 → GPIO13（TOUCH_PAD_NUM12）
+    // active_thresh 不用硬件中断判活（我们自己轮询 raw + 软件基线），置 0
+    touch_channel_config_t chan_cfg = {
+        .active_thresh = {0},
+        .charge_speed = TOUCH_CHARGE_SPEED_7,       // 最快充放电，分辨率最高
+        .init_charge_volt = TOUCH_INIT_CHARGE_VOLT_DEFAULT,
+    };
+    touch_channel_handle_t chan_handle = nullptr;
+    err = touch_sensor_new_channel(sens_handle, 12, &chan_cfg, &chan_handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "触摸通道 12 创建失败: %s", esp_err_to_name(err));
+        touch_sensor_del_controller(sens_handle);
+        vTaskDelete(nullptr);
+        return;
+    }
+
+    err = touch_sensor_enable(sens_handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "触摸控制器使能失败: %s", esp_err_to_name(err));
+        vTaskDelete(nullptr);
+        return;
+    }
+    // 启动 FSM 连续扫描（等价于 legacy 的 fsm_start）
+    err = touch_sensor_start_continuous_scanning(sens_handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "触摸连续扫描启动失败: %s", esp_err_to_name(err));
+        vTaskDelete(nullptr);
+        return;
+    }
+
+    // ★ 关键：等外设稳定后再测基线
+    // 舵机 PWM、WiFi、音频等上电后会改变触摸传感器的电气环境，
+    // 若立即测基线，会捕获到非稳态的瞬态值（历史上曾测到 ~1.86M 或 ~155K），
+    // 导致后续 delta 一直很大，3 秒一次误触发摇头。
+    const int kSettleMs = 3000;
+    ESP_LOGI(TAG, "触摸传感器启动，等待外设稳定 %d ms...", kSettleMs);
+    vTaskDelay(pdMS_TO_TICKS(kSettleMs));
+
+    // 取稳态基线（32 样本均值，约 0.7 秒），与主循环一致使用 FILTER 值
+    const int kBaselineSamples = 32;
+    uint32_t sum = 0;
+    uint32_t raw = 0;
+    for (int i = 0; i < kBaselineSamples; i++) {
+        touch_channel_read_data(chan_handle, TOUCH_CHAN_DATA_TYPE_SMOOTH, &raw);
+        sum += raw;
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+    uint32_t baseline = sum / kBaselineSamples;
+
+    // ★ 基线主存储改用浮点：消除整数 EWMA 的精度截断问题。
+    // 1023:1 整数跟踪在 baseline≈51000 量级下，要 baseline 移动 1 单位需要
+    // raw 高出 ≈1024 单位(2%)；当前 raw 仅偏离基线 0.25%，整数除法每帧
+    // 截断为 baseline 不动 → idle delta 长期偏 +130~+200 不收敛。
+    // 浮点 EWMA 每帧移动 0.1% × |raw-baseline|，τ≈50s 即可收敛到 raw 均值。
+    double baseline_f = (double)baseline;
+
+    // 合理性检查：基线应在 [100, 200000] 区间
+    // 电极面积适中时一般 ~2000~50000
+    if (baseline < 100 || baseline > 200000) {
+        ESP_LOGE(TAG, "触摸基线异常 raw=%u，触摸检测禁用，请检查硬件/电极面积",
+                 baseline);
+        vTaskDelete(nullptr);
+        return;
+    }
+
+    // 阈值：稳态漂移由滚动基线吸收后，空闲 delta 应趋近 0；
+    // idle 实测峰值 ~220，触摸信号峰值 ~282(单帧)，故阈值取 240。
+    int threshold = TOUCH_PAD_HEAD_THRESHOLD;
+    ESP_LOGI(TAG, "触摸基线 raw=%u 阈值=%d", baseline, threshold);
+
+    TickType_t last_trigger = 0;
+    int debug_count = 0;      // 调试：每 20×50ms = 1s 打印一次 raw/delta/baseline
+    int baseline_log = 0;     // 调试：每 200×50ms = 10s 打印一次 baseline 变化确认跟踪生效
+    int over_cnt = 0;         // 连续超阈值帧计数，避免单点噪声触发
+    bool armed = true;        // 边沿锁存：触发后置 false，仅 cooldown 结束后置 true
+    while (true) {
+        // SMOOTH 值：驱动内置 IIR 滤波，比 RAW 平滑
+        touch_channel_read_data(chan_handle, TOUCH_CHAN_DATA_TYPE_SMOOTH, &raw);
+        const int delta = (int)raw - (int)baseline;
+        const int adelta = delta < 0 ? -delta : delta;
+        if (++debug_count >= 20) {
+            ESP_LOGI(TAG, "raw=%u delta=%d baseline=%u", raw, delta, baseline);
+            debug_count = 0;
+        }
+        if (++baseline_log >= 200) {
+            // baseline 每 10s 必打一行：若发现 baseline 长时间纹丝不动，说明
+            // 浮点跟踪逻辑没生效或被条件分支跳过。
+            ESP_LOGI(TAG, "baseline=%u baseline_f=%.1f", baseline, baseline_f);
+            baseline_log = 0;
+        }
+
+        TickType_t now = xTaskGetTickCount();
+        const bool in_cooldown =
+            (now - last_trigger) < pdMS_TO_TICKS(TOUCH_PAD_HEAD_DEBOUNCE_MS);
+
+        if (adelta > threshold) {
+            // ★ 边沿触发 + 短确认：阈值 240 时触摸峰值仅持续 2~3 帧，
+            // 5 帧确认来不及累计。改为 2 帧确认（约 100ms）。
+            if (armed && !in_cooldown) {
+                if (++over_cnt >= 2) {  // 连续 2 帧确认（约 100ms）
+                    ESP_LOGI(TAG, "触摸检测 delta=%d 触发摇头", delta);
+                    // 52 = ACTION_DUCK_SHAKE_HEAD，4 步振荡、1.0s 周期、0 居中、30° 幅度
+                    OttoQueueAction(52, 4, 1000, 0, 30);
+                    last_trigger = now;
+                    armed = false;
+                    over_cnt = 0;
+                }
+            }
+        } else {
+            over_cnt = 0;
+            // 关键：cooldown 期间即使 delta 回落到阈值以内，也保持 armed=false，
+            // 避免一次触摸动作执行期间被反复触发。仅 cooldown 结束后才重新武装。
+            if (!in_cooldown) {
+                armed = true;
+            }
+        }
+
+        // ★ 基线跟踪（**只向下**浮点 EWMA，保留触摸信号幅度）：
+// 历史 bug（v3）：1023:1 双向跟踪最终让基线收敛到 idle raw 均值（~51200），
+// 触摸峰值 raw=51350 → 真实 delta 缩水到 ~150，远低于阈值 → 永不触发。
+// 现在基线**只允许向下跟踪**（raw < baseline 时慢速吸收漂移），
+// **不允许向上收敛**（raw > baseline 时基线不动）。
+// 这样：
+// - idle 时 raw > baseline → 基线不动，idle delta 长期保持初始偏置 ~+130
+// - 触摸时 raw 跳到峰值 → delta 达 ~280，远高于阈值 150
+// - 触摸释放后 raw 回到 idle 均值，基线仍不动
+// - 温度漂移让 raw 下降时，基线慢速跟随（4095:1, τ≈205s）
+// 阈值 150 + over_cnt 2 帧：idle +130 < 150 安全，触摸 +280 > 150 触发。
+if (!in_cooldown && (int)raw < (int)baseline) {
+    const double alpha = 1.0 / (double)(TOUCH_BASELINE_SLOW_RATIO + 1);
+    baseline_f = baseline_f * (1.0 - alpha) + (double)raw * alpha;
+    baseline = (uint32_t)(baseline_f + 0.5);
+}
+
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+}
+
+static void StartTouchHeadShake() {
+    xTaskCreate(TouchHeadShakeTask, "touch_head", 2048, nullptr, 5, nullptr);
+}
 
 class MicroduckXiaozhi : public WifiBoard {
 private:
@@ -390,6 +565,7 @@ public:
         }
 
         InitializeOttoController();
+        StartTouchHeadShake();
         ws_control_server_ = nullptr;
         GetBacklight()->RestoreBrightness();
     }

@@ -147,6 +147,25 @@ constexpr HardwareConfig NON_CAMERA_VERSION_CONFIG = {
 #define CAMERA_D0 (GPIO_NUM_12)
 #define CAMERA_D1 (GPIO_NUM_14)
 #define CAMERA_D2 (GPIO_NUM_21)
+
+// 鸭头触摸电极：GPIO13 → TOUCH_PAD_NUM12（T12）
+// 注意：TOUCH_PAD_NUM0（GPIO1）是 ESP32-S3 内部去噪通道，禁止作为触摸传感使用
+// 无摄像头版 config 中 GPIO13 无任何占用，且不是 strapping pin
+#define TOUCH_PAD_HEAD_GPIO      GPIO_NUM_13
+// 阈值选择：基线 = 启动 idle 均值（约 51200）。
+// - idle delta 在 ±50 噪声内（基线不动 + raw 围绕 idle 均值波动）
+// - 触摸曲线：idle +119 → +119 → +119 → +150 → 释放
+//   （注意：触摸峰值只 1 帧 =150；阈值必须 ≤ 触摸曲线第二帧 delta=119
+//    才能让 over_cnt=2 帧连续累计）
+// - 阈值 115：触摸 119、150 两帧连续 > 115 → 触发
+//              idle 偶发 delta=+60~+80 < 115，余量 35+
+// （v5=110 时偶发误触，上调到 115 略收紧）
+#define TOUCH_PAD_HEAD_THRESHOLD 115
+#define TOUCH_PAD_HEAD_DEBOUNCE_MS 3000 // 两次触摸间的最小间隔，避免抖动
+// 长基线跟踪：每帧 baseline 向 raw 移动 1/1024，约 50s 时间常数（τ）。
+// 慢基线跟踪：每帧移动 1/4096，约 200s 时间常数，仅在 idle 怀疑有漂移时启用。
+#define TOUCH_BASELINE_FAST_RATIO 1023
+#define TOUCH_BASELINE_SLOW_RATIO 4095
 #define CAMERA_D3 (GPIO_NUM_13)
 #define CAMERA_D4 (GPIO_NUM_11)
 #define CAMERA_D5 (GPIO_NUM_9)
