@@ -5,7 +5,8 @@
 #include <cJSON.h>
 #include <esp_log.h>
 
-#include <cstdlib> 
+#include <algorithm>
+#include <cstdlib>
 #include <cstring>
 
 #include "application.h"
@@ -50,26 +51,21 @@ private:
         ACTION_BEND = 6,
         ACTION_SHAKE_LEG = 7,
         ACTION_SIT = 25,  // 坐下
-        ACTION_RADIO_CALISTHENICS = 26,  // 广播体操
-        ACTION_MAGIC_CIRCLE = 27,  // 爱的魔力转圈圈
         ACTION_UPDOWN = 8,
         ACTION_TIPTOE_SWING = 9,
         ACTION_JITTER = 10,
         ACTION_ASCENDING_TURN = 11,
         ACTION_CRUSAITO = 12,
         ACTION_FLAPPING = 13,
-        ACTION_HANDS_UP = 14,
-        ACTION_HANDS_DOWN = 15,
-        ACTION_HAND_WAVE = 16,
-        ACTION_WINDMILL = 20,  // 大风车
-        ACTION_TAKEOFF = 21,   // 起飞
-        ACTION_FITNESS = 22,   // 健身
-        ACTION_GREETING = 23,  // 打招呼
-        ACTION_SHY = 24,        // 害羞
         ACTION_SHOWCASE = 28,   // 展示动作
         ACTION_HOME = 17,
         ACTION_SERVO_SEQUENCE = 18,  // 舵机序列（自编程）
         ACTION_WHIRLWIND_LEG = 19,   // 旋风腿
+        // 鸭子版：ACTION_RADIO_CALISTHENICS=26 / ACTION_HANDS_UP=14 /
+        //   ACTION_HANDS_DOWN=15 / ACTION_HAND_WAVE=16 / ACTION_WINDMILL=20 /
+        //   ACTION_TAKEOFF=21 / ACTION_FITNESS=22 / ACTION_GREETING=23 /
+        //   ACTION_SHY=24 / ACTION_MAGIC_CIRCLE=27 等手部动作已删除
+        //   （原 left_hand/right_hand 舵机已复用为脖/嘴，对应 self.duck.* 工具）
         // -- 鸭子嘴部/脖子专用动作（复用 steps/speed/direction/amount 字段） --
         ACTION_DUCK_RESET = 50,      // 启动时鸭子初始姿态（脖90°、嘴130°）
         ACTION_DUCK_TURN_HEAD = 51,  // 扭头（direction -1左/0中/1右，amount 幅度）
@@ -115,9 +111,9 @@ private:
                             for (int j = 0; j < SERVO_COUNT; j++) {
                                 current_positions[j] = 90;  // 默认中间位置
                             }
-                            // 手部舵机默认位置
-                            current_positions[LEFT_HAND] = 45;
-                            current_positions[RIGHT_HAND] = 180 - 45;
+                            // 鸭子版：脖/嘴默认位 = 鸭中立（脖 90° + 嘴 130°），不是 Otto 手位 45°/135°
+                            current_positions[LEFT_HAND] = 90;
+                            current_positions[RIGHT_HAND] = 130;
                             
                             for (int i = 0; i < array_size; i++) {
                                 cJSON* action_item = cJSON_GetArrayItem(actions, i);
@@ -132,7 +128,8 @@ private:
                                         int period = 300;  // 默认周期300毫秒
                                         float steps = 8.0;  // 默认步数8.0
                                         
-                                        const char* servo_names[] = {"ll", "rl", "lf", "rf", "lh", "rh"};
+                                        // 鸭子版舵机键名：ll=左腿 rl=右腿 lf=左脚 rf=右脚 neck=鸭脖 beak=鸭嘴
+                                        const char* servo_names[] = {"ll", "rl", "lf", "rf", "neck", "beak"};
                                         
                                         // 读取振幅（短键名 "a"），默认0度
                                         for (int j = 0; j < SERVO_COUNT; j++) {
@@ -155,13 +152,27 @@ private:
                                         for (int j = 0; j < SERVO_COUNT; j++) {
                                             center_angle[j] = 90;  // 默认中心角度90度（中间位置）
                                         }
+                                        // 鸭子版嘴（beak）默认中心 = 张开/闭合区间中点 115°（[100°, 130°]），
+                                        // 避免 LLM 只给振幅不给中心时嘴被防护逻辑强制静止
+                                        center_angle[RIGHT_HAND] = 115;
                                         cJSON* center_item = cJSON_GetObjectItem(osc_item, "o");
                                         if (cJSON_IsObject(center_item)) {
                                             for (int j = 0; j < SERVO_COUNT; j++) {
                                                 cJSON* center_value = cJSON_GetObjectItem(center_item, servo_names[j]);
                                                 if (cJSON_IsNumber(center_value)) {
                                                     int center = center_value->valueint;
-                                                    if (center >= 0 && center <= 180) {
+                                                    // 鸭子版嘴（RIGHT_HAND）机械可控范围 [100°, 130°]，
+                                                    // 越界 center 将导致振荡撞机械限位，越界值拒绝；
+                                                    // 其他舵机保持 [0, 180] 通用范围。
+                                                    if (j == RIGHT_HAND) {
+                                                        if (center >= 100 && center <= 130) {
+                                                            center_angle[j] = center;
+                                                        } else {
+                                                            ESP_LOGW(TAG,
+                                                                "忽略 beak center 越界值 %d（合法 [100, 130]）",
+                                                                center);
+                                                        }
+                                                    } else if (center >= 0 && center <= 180) {
                                                         center_angle[j] = center;
                                                     }
                                                 }
@@ -212,6 +223,27 @@ private:
                                             if (steps > 20.0) steps = 20.0;  // 与描述一致，限制20.0
                                         }
                                         
+                                        // 鸭子版嘴（RIGHT_HAND）安全裁剪：保证 center±amp ∈ [100°, 130°]，
+                                        // 防止振幅过大撞击机械限位产生抖动/卡死
+                                        {
+                                            int beak_center = center_angle[RIGHT_HAND];
+                                            if (beak_center < 100 || beak_center > 130) {
+                                                // center 越界（虽然 center 已做过检查，这里再做一次防护）
+                                                amplitude[RIGHT_HAND] = 0;
+                                            } else {
+                                                int max_amp = std::min(beak_center - 100,
+                                                                      130 - beak_center);
+                                                if (amplitude[RIGHT_HAND] > max_amp) {
+                                                    int old_amp = amplitude[RIGHT_HAND];
+                                                    amplitude[RIGHT_HAND] = (max_amp < 0 ? 0 : max_amp);
+                                                    ESP_LOGW(TAG,
+                                                        "beak 振幅裁剪 %d→%d（中心 %d°，安全范围 [%d°, %d°]）",
+                                                        old_amp, amplitude[RIGHT_HAND], beak_center,
+                                                        100, 130);
+                                                }
+                                            }
+                                        }
+
                                         // 执行振荡 - 使用Execute2，以绝对角度为中心
                                         ESP_LOGI(TAG, "执行振荡动作%d: period=%d, steps=%.1f", i, period, steps);
                                         controller->otto_.Execute2(amplitude, center_angle, period, phase_diff, steps);
@@ -231,15 +263,25 @@ private:
                                         // 从JSON中读取舵机位置（短键名 "s"）
                                         cJSON* servos_item = cJSON_GetObjectItem(action_item, "s");
                                         if (cJSON_IsObject(servos_item)) {
-                                            // 短键名：ll/rl/lf/rf/lh/rh
-                                            const char* servo_names[] = {"ll", "rl", "lf", "rf", "lh", "rh"};
+                                            // 鸭子版舵机键名：ll/rl/lf/rf/neck/beak
+                                            const char* servo_names[] = {"ll", "rl", "lf", "rf", "neck", "beak"};
                                             
                                             for (int j = 0; j < SERVO_COUNT; j++) {
                                                 cJSON* servo_value = cJSON_GetObjectItem(servos_item, servo_names[j]);
                                                 if (cJSON_IsNumber(servo_value)) {
                                                     int position = servo_value->valueint;
-                                                    // 限制位置范围在0-180度
-                                                    if (position >= 0 && position <= 180) {
+                                                    // 鸭子版嘴(RIGHT_HAND)机械可控范围 [100°, 130°]，
+                                                    // 越界舵机会撞机械限位产生抖动/卡死，强制拒绝；
+                                                    // 其他舵机保持 [0, 180] 通用范围。
+                                                    if (j == RIGHT_HAND) {
+                                                        if (position >= 100 && position <= 130) {
+                                                            servo_target[j] = position;
+                                                        } else {
+                                                            ESP_LOGW(TAG,
+                                                                "忽略 beak 越界值 %d（合法 [100, 130]）",
+                                                                position);
+                                                        }
+                                                    } else if (position >= 0 && position <= 180) {
                                                         servo_target[j] = position;
                                                     }
                                                 }
@@ -337,16 +379,7 @@ private:
                         case ACTION_SIT:
                             controller->otto_.Sit();
                             break;
-                        case ACTION_RADIO_CALISTHENICS:
-                            if (controller->has_hands_) {
-                                controller->otto_.RadioCalisthenics();
-                            }
-                            break;
-                        case ACTION_MAGIC_CIRCLE:
-                            if (controller->has_hands_) {
-                                controller->otto_.MagicCircle();
-                            }
-                            break;
+                        
                         case ACTION_SHOWCASE:
                             controller->otto_.Showcase();
                             break;
@@ -373,46 +406,7 @@ private:
                         case ACTION_WHIRLWIND_LEG:
                             controller->otto_.WhirlwindLeg(params.steps, params.speed, params.amount);
                             break;
-                        case ACTION_HANDS_UP:
-                            if (controller->has_hands_) {
-                                controller->otto_.HandsUp(params.speed, params.direction);
-                            }
-                            break;
-                        case ACTION_HANDS_DOWN:
-                            if (controller->has_hands_) {
-                                controller->otto_.HandsDown(params.speed, params.direction);
-                            }
-                            break;
-                        case ACTION_HAND_WAVE:
-                            if (controller->has_hands_) {
-                                controller->otto_.HandWave( params.direction);
-                            }
-                            break;
-                        case ACTION_WINDMILL:
-                            if (controller->has_hands_) {
-                                controller->otto_.Windmill(params.steps, params.speed, params.amount);
-                            }
-                            break;
-                        case ACTION_TAKEOFF:
-                            if (controller->has_hands_) {
-                                controller->otto_.Takeoff(params.steps, params.speed, params.amount);
-                            }
-                            break;
-                        case ACTION_FITNESS:
-                            if (controller->has_hands_) {
-                                controller->otto_.Fitness(params.steps, params.speed, params.amount);
-                            }
-                            break;
-                        case ACTION_GREETING:
-                            if (controller->has_hands_) {
-                                controller->otto_.Greeting(params.direction, params.steps);
-                            }
-                            break;
-                        case ACTION_SHY:
-                            if (controller->has_hands_) {
-                                controller->otto_.Shy(params.direction, params.steps);
-                            }
-                            break;
+                        
                         case ACTION_HOME:
                             controller->otto_.Home(true);
                             break;
@@ -435,11 +429,15 @@ private:
                         }
                         case ACTION_DUCK_SHAKE_HEAD: {
                             // 摇头：脖在 90° 中心附近左右振荡
+                            // Oscillator 公式：角度 = amp*sin(phase) + offset + 90，
+                            // 围绕中位 90° 振荡时 offset 必须为 0。
+                            // （历史 bug：offset=90 会让角度 = amp*sin+180，
+                            //   钳位后脖在 150°~180° 甩到最右侧抖动，而非左右摇头）
                             int amp[SERVO_COUNT] = {0};
                             int offset[SERVO_COUNT] = {0};
                             double phase[SERVO_COUNT] = {0};
                             amp[LEFT_HAND] = params.amount > 0 ? params.amount : 30;
-                            offset[LEFT_HAND] = 90;
+                            offset[LEFT_HAND] = 0;
                             phase[LEFT_HAND] = 0;
                             int period = params.speed > 0 ? params.speed : 600;
                             float cycles = params.steps > 0 ? params.steps : 3.0f;
@@ -449,9 +447,11 @@ private:
                         }
                         case ACTION_DUCK_OPEN_BEAK: {
                             // amount: 张开幅度；嘴闭合基准 130°，开 = 130 - amount
-                            int amount = params.amount > 0 ? params.amount : 40;
+                            // 规格：closed=130°，max open=100°，可控范围 [100°, 130°]
+                            int amount = params.amount > 0 ? params.amount : 30;
                             int target = 130 - amount;
-                            if (target < 50) target = 50;
+                            if (target < 100) target = 100;  // 不超过最大张开 (100°)
+                            if (target > 130) target = 130;  // 不超过闭合位 (130°)
                             controller->otto_.MoveSingle(target, RIGHT_HAND);
                             break;
                         }
@@ -460,12 +460,18 @@ private:
                             break;
                         }
                         case ACTION_DUCK_FLAP_BEAK: {
-                            // 嘴扇拍：steps 次开关周期；speed 为周期
+                            // 嘴扇拍：amount 是半幅度（5-15 度），
+                            // 中心 115°，范围 [100°, 130°]
+                            int half = params.amount > 0 ? params.amount : 15;
+                            if (half > 15) half = 15;        // 限制 max=15，保证在 [100°, 130°]
+                            if (half < 5) half = 5;          // 最小幅度
                             int amp[SERVO_COUNT] = {0};
                             int offset[SERVO_COUNT] = {0};
                             double phase[SERVO_COUNT] = {0};
-                            int half = params.amount > 0 ? params.amount : 30;
-                            offset[RIGHT_HAND] = 130 - half;  // 中心取开闭中间
+                            // 中心 115° → offset = pos - 90 = 25
+                            // 振荡 pos = amp*sin + offset + 90 = half*sin + 115
+                            // → 范围 [115-half, 115+half]，确保 [100°, 130°]
+                            offset[RIGHT_HAND] = 25;
                             amp[RIGHT_HAND] = half;
                             phase[RIGHT_HAND] = 0;
                             int period = params.speed > 0 ? params.speed : 400;
@@ -519,7 +525,7 @@ private:
                             // 如果后面还有动作，先不归位，避免“动作末尾急停+马上再启动”
                             if (pending_actions == 0) {
                                 // 振荡类动作（摇头 / 嘴扇动）走鸭子中立（脖 90° + 嘴 130°），
-                                // 而不是 Otto 标准 Home(45°/135°)，保证唤醒词触发后回到初始位
+                                // 保证唤醒词触发后回到初始位
                                 if (params.action_type == ACTION_DUCK_SHAKE_HEAD
                                     || params.action_type == ACTION_DUCK_FLAP_BEAK) {
                                     int angles[SERVO_COUNT];
@@ -528,7 +534,15 @@ private:
                                     angles[RIGHT_HAND] = 130;  // 鸭嘴闭合
                                     controller->otto_.MoveServos(500, angles);
                                 } else {
-                                    controller->otto_.Home(params.action_type != ACTION_HANDS_UP);
+                                    // 鸭子版：所有腿部动作（walk/turn/jump/swing/...）结束后，
+                                    // 同样回到鸭中立（脖 90° + 嘴 130°），不再调 Otto Home(true)
+                                    // （旧 Home 会把手位设 45°/135°，导致每条腿动作结束都触发
+                                    // 脖子 45° 大跳 + 嘴 5° 微跳，表现为"嘴巴乱动"）。
+                                    int angles[SERVO_COUNT];
+                                    for (int i = 0; i < SERVO_COUNT; i++) angles[i] = 90;
+                                    angles[LEFT_HAND] = 90;    // 鸭脖中位
+                                    angles[RIGHT_HAND] = 130;  // 鸭嘴闭合
+                                    controller->otto_.MoveServos(500, angles);
                                 }
                             }
                         }
@@ -549,18 +563,7 @@ private:
     }
 
     void QueueAction(int action_type, int steps, int speed, int direction, int amount) {
-        // 检查手部动作
-        if ((action_type >= ACTION_HANDS_UP && action_type <= ACTION_HAND_WAVE) || 
-            (action_type == ACTION_WINDMILL) || (action_type == ACTION_TAKEOFF) || 
-            (action_type == ACTION_FITNESS) || (action_type == ACTION_GREETING) ||
-            (action_type == ACTION_SHY) || (action_type == ACTION_RADIO_CALISTHENICS) ||
-            (action_type == ACTION_MAGIC_CIRCLE)) {
-            if (!has_hands_) {
-                ESP_LOGW(TAG, "尝试执行手部动作，但机器人没有配置手部舵机");
-                return;
-            }
-        }
-
+        // 鸭子版：原手部动作枚举已全部删除，此处无需再检查手部可用性
         ESP_LOGI(TAG, "动作控制: 类型=%d, 步数=%d, 速度=%d, 方向=%d, 幅度=%d", action_type, steps,
                  speed, direction, amount);
 
@@ -607,10 +610,13 @@ private:
         int right_leg = settings.GetInt("right_leg", 0);
         int left_foot = settings.GetInt("left_foot", 0);
         int right_foot = settings.GetInt("right_foot", 0);
-        int left_hand = settings.GetInt("left_hand", 0);
-        int right_hand = settings.GetInt("right_hand", 0);
+        // 鸭子版：脖/嘴 NVS 键名为 neck/beak；兼容旧键 left_hand/right_hand（旧版固件写入）
+        int left_hand = settings.GetInt("neck", 0);
+        if (left_hand == 0) left_hand = settings.GetInt("left_hand", 0);
+        int right_hand = settings.GetInt("beak", 0);
+        if (right_hand == 0) right_hand = settings.GetInt("right_hand", 0);
 
-        ESP_LOGI(TAG, "从NVS加载微调设置: 左腿=%d, 右腿=%d, 左脚=%d, 右脚=%d, 左手=%d, 右手=%d",
+        ESP_LOGI(TAG, "从NVS加载微调设置: 左腿=%d, 右腿=%d, 左脚=%d, 右脚=%d, 鸭脖=%d, 鸭嘴=%d",
                  left_leg, right_leg, left_foot, right_foot, left_hand, right_hand);
 
         otto_.SetTrims(left_leg, right_leg, left_foot, right_foot, left_hand, right_hand);
@@ -627,8 +633,15 @@ public:
             hw_config.right_hand_pin
         );
 
-        has_hands_ = (hw_config.left_hand_pin != GPIO_NUM_NC && hw_config.right_hand_pin != GPIO_NUM_NC);
-        ESP_LOGI(TAG, "Otto机器人初始化%s手部舵机", has_hands_ ? "带" : "不带");
+        // 鸭子版适配：手部舵机已被改造为脖(left_hand=GPIO4)和嘴(right_hand=GPIO7)，
+        // 硬件上"手"舵机实际是脖/嘴。LLM 调用 hands_up/windmill/... 会让脖/嘴
+        // 当胳膊乱动，破坏鸭子语义。
+        // 强制 has_hands_=false 让 self.otto.action 里的所有手部动作分支返回错误，
+        // 同时 ActionTask 内的 HandsUp/HandWave/Windmill/Takeoff 等 case 跳过。
+        // LLM 通过 self.duck.* 调用脖/嘴动作。
+        has_hands_ = false;
+        ESP_LOGI(TAG, "Otto机器人初始化%s手部舵机（鸭子版：手部舵机已用作脖/嘴，禁用所有手部动作）",
+                 has_hands_ ? "带" : "不带");
         ESP_LOGI(TAG, "舵机引脚配置: LL=%d, RL=%d, LF=%d, RF=%d, LH=%d, RH=%d",
                  hw_config.left_leg_pin, hw_config.right_leg_pin,
                  hw_config.left_foot_pin, hw_config.right_foot_pin,
@@ -638,7 +651,9 @@ public:
 
         action_queue_ = xQueueCreate(10, sizeof(OttoActionParams));
 
-        QueueAction(ACTION_HOME, 1, 1000, 1, 0);  // direction=1表示复位手部
+        // 鸭子版启动姿态：仅入队 DUCK_RESET（脖 90° + 嘴 130°），不再前置 Otto Home()，
+        // 避免上电后嘴先 0→135° 再 135°→130° 的两次抖动。原 Home() 把手位设 45°/135°，
+        // 对鸭子版无意义且与 DUCK_RESET 重复。
         QueueAction(ACTION_DUCK_RESET, 1, 500, 0, 0);  // 鸭子初始姿态：脖中位 + 嘴闭合
 
         RegisterMcpTools();
@@ -652,14 +667,13 @@ public:
         // 统一动作工具（除了舵机序列外的所有动作）
         mcp_server.AddTool("self.otto.action",
                            "执行机器人动作。action: 动作名称；根据动作类型提供相应参数：direction: 方向，1=前进/左转，-1=后退/右转；0=左右同时"
-                           "steps: 动作步数，1-100；speed: 动作速度，100-3000，数值越小越快；amount: 动作幅度，0-170；arm_swing: 手臂摆动幅度，0-170；"
-                           "基础动作：walk(行走，需steps/speed/direction/arm_swing)、turn(转身，需steps/speed/direction/arm_swing)、jump(跳跃，需steps/speed)、"
+                           "steps: 动作步数，1-100；speed: 动作速度，100-3000，数值越小越快；amount: 动作幅度，0-170；arm_swing: 已废弃，鸭子版忽略。"
+                           "基础动作：walk(行走，需steps/speed/direction)、turn(转身，需steps/speed/direction)、jump(跳跃，需steps/speed)、"
                            "swing(摇摆，需steps/speed/amount)、moonwalk(太空步，需steps/speed/direction/amount)、bend(弯曲，需steps/speed/direction)、"
                            "shake_leg(摇腿，需steps/speed/direction)、updown(上下运动，需steps/speed/amount)、whirlwind_leg(旋风腿，需steps/speed/amount)；"
-                           "固定动作：sit(坐下)、showcase(展示动作)、home(复位)；"
-                           "手部动作(需手部舵机)：hands_up(举手，需speed/direction)、hands_down(放手，需speed/direction)、hand_wave(挥手，需direction)、"
-                           "windmill(大风车，需steps/speed/amount)、takeoff(起飞，需steps/speed/amount)、fitness(健身，需steps/speed/amount)、"
-                           "greeting(打招呼，需direction/steps)、shy(害羞，需direction/steps)、radio_calisthenics(广播体操)、magic_circle(爱的魔力转圈圈)",
+                           "固定动作：sit(坐下)、showcase(展示动作)、home(鸭中立位复位，等价于 self.duck.neutral)。"
+                           "重要：鸭子版无手臂！'挥手/招手/举手/打招呼/再见'等手部意图请用 self.duck.shake_head 或 self.duck.turn_head；"
+                           "本工具的 swing/updown/whirlwind_leg 是腿脚动作，不能代替'挥手'。",
                            PropertyList({
                                Property("action", kPropertyTypeString, "sit"),
                                Property("steps", kPropertyTypeInteger, 3, 1, 100),
@@ -714,72 +728,12 @@ public:
                                    QueueAction(ACTION_SHOWCASE, 1, 0, 0, 0);
                                    return true;
                                } else if (action == "home") {
-                                   QueueAction(ACTION_HOME, 1, 1000, 1, 0);
-                                   return true;
-                               }
-                               // 手部动作
-                               else if (action == "hands_up") {
-                                   if (!has_hands_) {
-                                       return "错误：此动作需要手部舵机支持";
-                                   }
-                                   QueueAction(ACTION_HANDS_UP, 1, speed, direction, 0);
-                                   return true;
-                               } else if (action == "hands_down") {
-                                   if (!has_hands_) {
-                                       return "错误：此动作需要手部舵机支持";
-                                   }
-                                   QueueAction(ACTION_HANDS_DOWN, 1, speed, direction, 0);
-                                   return true;
-                               } else if (action == "hand_wave") {
-                                   if (!has_hands_) {
-                                       return "错误：此动作需要手部舵机支持";
-                                   }
-                                   QueueAction(ACTION_HAND_WAVE, 1, 0, 0, direction);
-                                   return true;
-                               } else if (action == "windmill") {
-                                   if (!has_hands_) {
-                                       return "错误：此动作需要手部舵机支持";
-                                   }
-                                   QueueAction(ACTION_WINDMILL, steps, speed, 0, amount);
-                                   return true;
-                               } else if (action == "takeoff") {
-                                   if (!has_hands_) {
-                                       return "错误：此动作需要手部舵机支持";
-                                   }
-                                   QueueAction(ACTION_TAKEOFF, steps, speed, 0, amount);
-                                   return true;
-                               } else if (action == "fitness") {
-                                   if (!has_hands_) {
-                                       return "错误：此动作需要手部舵机支持";
-                                   }
-                                   QueueAction(ACTION_FITNESS, steps, speed, 0, amount);
-                                   return true;
-                               } else if (action == "greeting") {
-                                   if (!has_hands_) {
-                                       return "错误：此动作需要手部舵机支持";
-                                   }
-                                   QueueAction(ACTION_GREETING, steps, 0, direction, 0);
-                                   return true;
-                               } else if (action == "shy") {
-                                   if (!has_hands_) {
-                                       return "错误：此动作需要手部舵机支持";
-                                   }
-                                   QueueAction(ACTION_SHY, steps, 0, direction, 0);
-                                   return true;
-                               } else if (action == "radio_calisthenics") {
-                                   if (!has_hands_) {
-                                       return "错误：此动作需要手部舵机支持";
-                                   }
-                                   QueueAction(ACTION_RADIO_CALISTHENICS, 1, 0, 0, 0);
-                                   return true;
-                               } else if (action == "magic_circle") {
-                                   if (!has_hands_) {
-                                       return "错误：此动作需要手部舵机支持";
-                                   }
-                                   QueueAction(ACTION_MAGIC_CIRCLE, 1, 0, 0, 0);
+                                   // 鸭子版：home 等价于鸭中立位（脖90°+嘴130°），不再调 Otto Home()（手位45°/135°无意义）
+                                   QueueAction(ACTION_DUCK_NEUTRAL, 1, 500, 0, 0);
                                    return true;
                                } else {
-                                   return "错误：无效的动作名称。可用动作：walk, turn, jump, swing, moonwalk, bend, shake_leg, updown, whirlwind_leg, sit, showcase, home, hands_up, hands_down, hand_wave, windmill, takeoff, fitness, greeting, shy, radio_calisthenics, magic_circle";
+                                   return "错误：无效的动作名称。可用动作：walk, turn, jump, swing, moonwalk, bend, shake_leg, updown, whirlwind_leg, sit, showcase, home"
+                                          "（手部动作已移除，请用 self.duck.* 控制脖/嘴；home 在鸭子版等价于 self.duck.neutral 鸭中立位）";
                                }
                            });
 
@@ -788,18 +742,18 @@ public:
         mcp_server.AddTool(
             "self.otto.servo_sequences",
             "AI自定义动作编程（即兴动作）。支持分段发送序列：超过5个序列建议AI可以连续多次调用此工具，每次发送一个短序列，系统会自动排队按顺序执行。支持普通移动和振荡器两种模式。"
-            "机器人结构：双手可上下摆动，双腿可内收外展，双脚可上下翻转。"
+            "机器人结构：脖可左右转头，嘴可上下开合，双腿可内收外展，双脚可上下翻转。"
             "舵机说明："
             "ll(左腿)：内收外展，0度=完全外展，90度=中立，180度=完全内收；"
             "rl(右腿)：内收外展，0度=完全内收，90度=中立，180度=完全外展；"
             "lf(左脚)：上下翻转，0度=完全向上，90度=水平，180度=完全向下；"
             "rf(右脚)：上下翻转，0度=完全向下，90度=水平，180度=完全向上；"
-            "lh(左手)：上下摆动，0度=完全向下，90度=水平，180度=完全向上；"
-            "rh(右手)：上下摆动，0度=完全向上，90度=水平，180度=完全向下；"
+            "neck(鸭脖)：左右转头，0度=完全向左，90度=中立，180度=完全向右；"
+            "beak(鸭嘴)：上下开合，100度=最大张开，130度=闭合（鸭嘴默认位置）。鸭嘴机械可控范围仅 [100°, 130°]，超出此范围舵机无法到达并会撞击机件造成抖动或卡死，请勿设 beak=0/45/180 等越界值；"
             "sequence: 单个序列对象，包含'a'动作数组，顶层可选参数："
             "'d'(序列执行完成后延迟毫秒数，用于序列之间的停顿)。"
             "每个动作对象包含："
-            "普通模式：'s'舵机位置对象(键名：ll/rl/lf/rf/lh/rh，值：0-180度)，'v'移动速度100-3000毫秒(默认1000)，'d'动作后延迟毫秒数(默认0)；"
+            "普通模式：'s'舵机位置对象(键名：ll/rl/lf/rf/neck/beak，值：0-180度)，'v'移动速度100-3000毫秒(默认1000)，'d'动作后延迟毫秒数(默认0)；"
             "振荡模式：'osc'振荡器对象，包含'a'振幅对象(各舵机振幅10-90度，默认20度)，'o'中心角度对象(各舵机振荡中心绝对角度0-180度，默认90度)，'ph'相位差对象(各舵机相位差，度，0-360度，默认0度)，'p'周期100-3000毫秒(默认500)，'c'周期数0.1-20.0(默认5.0)；"
             "使用方式：AI可以连续多次调用此工具，每次发送一个序列，系统会自动排队按顺序执行。"
             "重要说明：左右腿脚震荡的时候，有一只脚必须在90度，否则会损坏机器人，如果发送多个序列（序列数>1），完成所有序列后需要复位时，AI应该最后单独调用self.otto.home工具进行复位，不要在序列中设置复位参数。"
@@ -809,10 +763,10 @@ public:
             "第3次调用{\"sequence\":\"{\\\"a\\\":[{\\\"s\\\":{\\\"ll\\\":80},\\\"v\\\":800}]}\"}，"
             "最后调用self.otto.home工具进行复位。"
             "振荡器模式示例："
-            "示例1-双臂同步摆动：{\"sequence\":\"{\\\"a\\\":[{\\\"osc\\\":{\\\"a\\\":{\\\"lh\\\":30,\\\"rh\\\":30},\\\"o\\\":{\\\"lh\\\":90,\\\"rh\\\":-90},\\\"p\\\":500,\\\"c\\\":5.0}}],\\\"d\\\":0}\"}；"
+            "示例1-脖嘴同步摆动（嘴中心115°，幅度15°，范围 [100°, 130°] 安全）：{\"sequence\":\"{\\\"a\\\":[{\\\"osc\\\":{\\\"a\\\":{\\\"neck\\\":20,\\\"beak\\\":15},\\\"o\\\":{\\\"neck\\\":90,\\\"beak\\\":115},\\\"p\\\":500,\\\"c\\\":5.0}}],\\\"d\\\":0}\"}；"
             "示例2-双腿交替振荡（波浪效果）：{\"sequence\":\"{\\\"a\\\":[{\\\"osc\\\":{\\\"a\\\":{\\\"ll\\\":20,\\\"rl\\\":20},\\\"o\\\":{\\\"ll\\\":90,\\\"rl\\\":-90},\\\"ph\\\":{\\\"rl\\\":180},\\\"p\\\":600,\\\"c\\\":3.0}}],\\\"d\\\":0}\"}；"
             "示例3-单腿振荡配合固定脚（安全）：{\"sequence\":\"{\\\"a\\\":[{\\\"osc\\\":{\\\"a\\\":{\\\"ll\\\":45},\\\"o\\\":{\\\"ll\\\":90,\\\"lf\\\":90},\\\"p\\\":400,\\\"c\\\":4.0}}],\\\"d\\\":0}\"}；"
-            "示例4-复杂多舵机振荡（手和腿）：{\"sequence\":\"{\\\"a\\\":[{\\\"osc\\\":{\\\"a\\\":{\\\"lh\\\":25,\\\"rh\\\":25,\\\"ll\\\":15},\\\"o\\\":{\\\"lh\\\":90,\\\"rh\\\":90,\\\"ll\\\":90,\\\"lf\\\":90},\\\"ph\\\":{\\\"rh\\\":180},\\\"p\\\":800,\\\"c\\\":6.0}}],\\\"d\\\":500}\"}；"
+            "示例4-脖嘴腿混合振荡（嘴中心115°，幅度15°，范围 [100°, 130°] 边界安全）：{\"sequence\":\"{\\\"a\\\":[{\\\"osc\\\":{\\\"a\\\":{\\\"neck\\\":25,\\\"beak\\\":15,\\\"ll\\\":15},\\\"o\\\":{\\\"neck\\\":90,\\\"beak\\\":115,\\\"ll\\\":90,\\\"lf\\\":90},\\\"ph\\\":{\\\"beak\\\":180},\\\"p\\\":800,\\\"c\\\":6.0}}],\\\"d\\\":500}\"}；"
             "示例5-快速摇摆：{\"sequence\":\"{\\\"a\\\":[{\\\"osc\\\":{\\\"a\\\":{\\\"ll\\\":30,\\\"rl\\\":30},\\\"o\\\":{\\\"ll\\\":90,\\\"rl\\\":90},\\\"ph\\\":{\\\"rl\\\":180},\\\"p\\\":300,\\\"c\\\":10.0}}],\\\"d\\\":0}\"}。",
             PropertyList({Property("sequence", kPropertyTypeString,
                                    "{\"a\":[{\"s\":{\"ll\":90,\"rl\":90},\"v\":1000}]}")}),
@@ -825,7 +779,7 @@ public:
             });
 
 
-        mcp_server.AddTool("self.otto.stop", "立即停止所有动作并复位", PropertyList(),
+        mcp_server.AddTool("self.otto.stop", "立即停止所有动作并复位（鸭子版：回到鸭中立位 脖90°+嘴130°）", PropertyList(),
                            [this](const PropertyList& properties) -> ReturnValue {
                                if (action_task_handle_ != nullptr) {
                                    vTaskDelete(action_task_handle_);
@@ -835,7 +789,8 @@ public:
                                PowerManager::ResumeBatteryUpdate();  // 停止动作时恢复电量更新
                                xQueueReset(action_queue_);
 
-                               QueueAction(ACTION_HOME, 1, 1000, 1, 0);
+                               // 鸭子版：stop + reset 等价于鸭中立位（脖90°+嘴130°），不再调 Otto Home()（手位45°/135°无意义）
+                               QueueAction(ACTION_DUCK_NEUTRAL, 1, 500, 0, 0);
                                return true;
                            });
 
@@ -977,7 +932,9 @@ public:
 
         mcp_server.AddTool(
             "self.duck.shake_head",
-            "鸭子摇头：在脖中位附近左右反复摆动（持续摇）。steps: 振荡次数 1-10；speed: 单次摆动周期 300-1500ms；amount: 摆动幅度 10-60 度。",
+            "鸭子摇头：脖中位附近左右反复摆动（持续摇）。steps: 振荡次数 1-10；speed: 单次摆动周期 300-1500ms；amount: 摆动幅度 10-60 度。"
+            "适用场景：'挥挥手/招手/打招呼/再见/摇头回应/表示否定'——鸭子无手臂，这类意图必须用本工具，"
+            "切勿用 self.otto.action 的 swing（那是腿脚摇摆）代替。",
             PropertyList({Property("steps", kPropertyTypeInteger, 3, 1, 10),
                           Property("speed", kPropertyTypeInteger, 600, 300, 1500),
                           Property("amount", kPropertyTypeInteger, 30, 10, 60)}),
@@ -991,15 +948,17 @@ public:
 
         mcp_server.AddTool(
             "self.duck.open_beak",
-            "张开鸭嘴。amount: 张开幅度 10-70 度（嘴闭合基准 130°，张开后 = 130 - amount）。speed: 动作速度 100-1500，数值越小越快。",
-            PropertyList({Property("amount", kPropertyTypeInteger, 40, 10, 70),
+            "张开鸭嘴。amount: 张开幅度 10-30 度（嘴闭合基准 130°，最大张开 100°，张开后 = 130 - amount）。speed: 动作速度 100-1500，数值越小越快。"
+            "【仅在用户明确要求'张嘴/张开嘴巴'时才调用】日常对话、回复、思考时**不要**主动调用；说话本身由音频播放呈现，不需要 LLM 模拟嘴部动作。",
+            PropertyList({Property("amount", kPropertyTypeInteger, 30, 10, 30),
                           Property("speed", kPropertyTypeInteger, 500, 100, 1500)}),
             [this](const PropertyList& properties) -> ReturnValue {
                 int amount = properties["amount"].value<int>();
                 int speed = properties["speed"].value<int>();
                 QueueAction(ACTION_DUCK_OPEN_BEAK, 1, speed, 0, amount);
                 int target = 130 - amount;
-                if (target < 50) target = 50;
+                if (target < 100) target = 100;  // 限位 max open
+                if (target > 130) target = 130;  // 限位 closed
                 char buf[96];
                 snprintf(buf, sizeof(buf), "{\"beak_angle\":%d}", target);
                 return std::string(buf);
@@ -1007,7 +966,8 @@ public:
 
         mcp_server.AddTool(
             "self.duck.close_beak",
-            "闭合鸭嘴。speed: 动作速度 100-1500。嘴默认闭合位置 130°。",
+            "闭合鸭嘴。speed: 动作速度 100-1500。嘴默认闭合位置 130°。"
+            "【仅在用户明确要求'闭嘴/合上嘴巴'时才调用】日常对话中**不要**主动调用。",
             PropertyList({Property("speed", kPropertyTypeInteger, 500, 100, 1500)}),
             [this](const PropertyList& properties) -> ReturnValue {
                 int speed = properties["speed"].value<int>();
@@ -1017,10 +977,11 @@ public:
 
         mcp_server.AddTool(
             "self.duck.flap_beak",
-            "鸭嘴扇动：连续开关嘴（类似说话/扑腾）。steps: 扇动次数 1-10；speed: 单次开关周期 200-1000ms；amount: 扇动幅度 10-60 度。",
+            "鸭嘴扇动：连续开关嘴（类似说话/扑腾）。steps: 扇动次数 1-10；speed: 单次开关周期 200-1000ms；amount: 半幅度 5-15 度（中心 115°，范围 [100°, 130°]，amount=15 为最大全幅）。"
+            "【仅在用户明确要求'扇嘴/嘴扑腾'时才调用】日常对话、回复、情绪表达时**不要**主动调用——LLM 不应模拟'说话时扇嘴'这种行为，说话由音频播放呈现。",
             PropertyList({Property("steps", kPropertyTypeInteger, 4, 1, 10),
                           Property("speed", kPropertyTypeInteger, 400, 200, 1000),
-                          Property("amount", kPropertyTypeInteger, 30, 10, 60)}),
+                          Property("amount", kPropertyTypeInteger, 15, 5, 15)}),
             [this](const PropertyList& properties) -> ReturnValue {
                 int steps = properties["steps"].value<int>();
                 int speed = properties["speed"].value<int>();
@@ -1040,8 +1001,8 @@ public:
 
         // 舵机名 → 索引映射（脖=LEFT_HAND=4, 嘴=RIGHT_HAND=5）
         auto servo_name_to_idx = [](const std::string& n) -> int {
-            if (n == "neck" || n == "left_hand" || n == "lh") return LEFT_HAND;
-            if (n == "beak" || n == "right_hand" || n == "rh") return RIGHT_HAND;
+            if (n == "neck") return LEFT_HAND;
+            if (n == "beak") return RIGHT_HAND;
             if (n == "left_leg" || n == "ll") return LEFT_LEG;
             if (n == "right_leg" || n == "rl") return RIGHT_LEG;
             if (n == "left_foot" || n == "lf") return LEFT_FOOT;
@@ -1062,10 +1023,11 @@ public:
                 if (idx < 0) {
                     return std::string("错误：未知 servo 名称，可选: neck/beak/left_leg/right_leg/left_foot/right_foot");
                 }
-                // 持久化到 NVS（namespace otto_trims，与 LoadTrimsFromNVS 一致）
+                // 持久化到 NVS（namespace otto_trims）
                 Settings settings("otto_trims", true);
+                // 鸭子版：脖/嘴键名为 neck/beak（旧 left_hand/right_hand 仅用于读取兼容，见 get_trims）
                 const char* keys[SERVO_COUNT] = {"left_leg", "right_leg", "left_foot",
-                                                 "right_foot", "left_hand", "right_hand"};
+                                                 "right_foot", "neck", "beak"};
                 settings.SetInt(keys[idx], offset);
                 // 立即生效：派发到动作队列
                 QueueAction(ACTION_DUCK_CALIBRATE, 1, 0, offset, idx);
@@ -1081,6 +1043,11 @@ public:
             PropertyList(),
             [](const PropertyList& properties) -> ReturnValue {
                 Settings settings("otto_trims", false);
+                // 鸭子版：脖/嘴优先读新键 neck/beak；旧版固件可能写入 left_hand/right_hand，零值时回退
+                int neck_trim = settings.GetInt("neck", 0);
+                if (neck_trim == 0) neck_trim = settings.GetInt("left_hand", 0);
+                int beak_trim = settings.GetInt("beak", 0);
+                if (beak_trim == 0) beak_trim = settings.GetInt("right_hand", 0);
                 char buf[256];
                 snprintf(buf, sizeof(buf),
                          "{\"left_leg\":%d,\"right_leg\":%d,\"left_foot\":%d,"
@@ -1089,8 +1056,7 @@ public:
                          (int)settings.GetInt("right_leg", 0),
                          (int)settings.GetInt("left_foot", 0),
                          (int)settings.GetInt("right_foot", 0),
-                         (int)settings.GetInt("left_hand", 0),
-                         (int)settings.GetInt("right_hand", 0));
+                         neck_trim, beak_trim);
                 return std::string(buf);
             });                           
 

@@ -90,6 +90,8 @@ void Oscillator::Attach(int pin, bool rev) {
                                           .hpoint = 0};
     ESP_ERROR_CHECK(ledc_channel_config(&ledc_channel));
 
+    ESP_LOGI(TAG, "Oscillator::Attach pin=%d ledc_ch=%u", (int)pin_, (unsigned)ledc_channel_);
+
     ledc_speed_mode_ = LEDC_LOW_SPEED_MODE;
 
     // pos_ = 90;

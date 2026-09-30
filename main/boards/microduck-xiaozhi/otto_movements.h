@@ -79,17 +79,8 @@ public:
     void Flapping(float steps = 1, int period = 1000, int height = 20, int dir = FORWARD);
     void WhirlwindLeg(float steps = 1, int period = 300, int amplitude = 30);
 
-    // -- 手部动作
-    void HandsUp(int period = 1000, int dir = 0);      // 双手举起
-    void HandsDown(int period = 1000, int dir = 0);    // 双手放下
-    void HandWave(int dir = LEFT);  // 挥手
-    void Windmill(float steps = 10, int period = 500, int amplitude = 90);  // 大风车
-    void Takeoff(float steps = 5, int period = 300, int amplitude = 40);   // 起飞
-    void Fitness(float steps = 5, int period = 1000, int amplitude = 25);  // 健身
-    void Greeting(int dir = LEFT, float steps = 5);  // 打招呼
-    void Shy(int dir = LEFT, float steps = 5);  // 害羞
-    void RadioCalisthenics();  // 广播体操
-    void MagicCircle();  // 爱的魔力转圈圈
+    // -- 手部动作已删除：鸭子版无手部舵机，原 left_hand/right_hand 已复用为脖/嘴
+    //    （对应 self.duck.* 工具）。如需引入新动作请直接加在下方的鸭子段。
     void Showcase();  // 展示动作（串联多个动作）
 
     // -- Servo limiter

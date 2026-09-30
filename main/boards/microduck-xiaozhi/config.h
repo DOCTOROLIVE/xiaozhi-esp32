@@ -134,7 +134,7 @@ constexpr HardwareConfig NON_CAMERA_VERSION_CONFIG = {
     .display_clk_pin = GPIO_NUM_9,
     .display_dc_pin = GPIO_NUM_46,
     .display_rst_pin = GPIO_NUM_11,
-    .display_cs_pin = GPIO_NUM_12,
+    .display_cs_pin = GPIO_NUM_NC,  // 实际 PCB 上 CS 直接接 GND；非 NC 会与 right_hand_pin (GPIO12) 冲突导致鸭嘴抖动
 
     .i2c_sda_pin = GPIO_NUM_NC,
     .i2c_scl_pin = GPIO_NUM_NC,
@@ -160,6 +160,8 @@ constexpr HardwareConfig NON_CAMERA_VERSION_CONFIG = {
 // - 阈值 115：触摸 119、150 两帧连续 > 115 → 触发
 //              idle 偶发 delta=+60~+80 < 115，余量 35+
 // （v5=110 时偶发误触，上调到 115 略收紧）
+// 注意：v18 起实际阈值 = max(本值, 基线×0.2%)（见 microduck_xiaozhi.cc），
+// 基线 ~392622 时阈值≈785；本值仅作为低基线（<57500）时的固定下限。
 #define TOUCH_PAD_HEAD_THRESHOLD 115
 #define TOUCH_PAD_HEAD_DEBOUNCE_MS 3000 // 两次触摸间的最小间隔，避免抖动
 // 长基线跟踪：每帧 baseline 向 raw 移动 1/1024，约 50s 时间常数（τ）。

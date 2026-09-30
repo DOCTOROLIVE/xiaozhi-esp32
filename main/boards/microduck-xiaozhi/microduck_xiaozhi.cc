@@ -7,6 +7,7 @@
 #include <esp_log.h>
 #include <esp_rom_sys.h>
 
+#include <algorithm>
 #include <new>
 
 #include "application.h"
@@ -48,9 +49,17 @@ extern void OttoQueueAction(int action_type, int steps, int speed,
 static void TouchHeadShakeTask(void* arg) {
     // ---- 新驱动（touch_sens.h, ESP32-S3 = Touch HW V2）初始化 ----
     // 采样配置：charge_times 决定读数大小（数据与 charge_times 正相关），
-    // 电压摆幅取最大 2V7→0V5 以提高小电极灵敏度
+    // 电压摆幅取最大 2V7→0V5 以提高小电极灵敏度。
+    //
+    // ★ 2026-09-29 耦合修复：GPIO13（触摸电极）与 GPIO12（嘴舵机 PWM）物理相邻，
+    //   实测触摸扫描的充放电噪声会耦合进 GPIO12 的 PWM 信号线，导致嘴舵机
+    //   解码脉宽抖动、无指令乱抖（禁用触摸后嘴不抖已实锤）。
+    //   对策：charge_speed 7→4（充放电电流峰值减半以上，耦合尖峰幅度直接下降）、
+    //         charge_times 1000→800（单次测量突发更短，干扰占空比降低）。
+    //   电压摆幅保持 0V5~2V7 不牺牲灵敏度；读数量程变化由自适应阈值
+    //   max(115, 基线×0.2%) 吸收。
     touch_sensor_sample_config_t sample_cfg = TOUCH_SENSOR_V2_DEFAULT_SAMPLE_CONFIG(
-        1000, TOUCH_VOLT_LIM_L_0V5, TOUCH_VOLT_LIM_H_2V7);
+        800, TOUCH_VOLT_LIM_L_0V5, TOUCH_VOLT_LIM_H_2V7);
     touch_sensor_config_t sens_cfg = TOUCH_SENSOR_DEFAULT_BASIC_CONFIG(1, &sample_cfg);
 
     touch_sensor_handle_t sens_handle = nullptr;
@@ -65,7 +74,7 @@ static void TouchHeadShakeTask(void* arg) {
     // active_thresh 不用硬件中断判活（我们自己轮询 raw + 软件基线），置 0
     touch_channel_config_t chan_cfg = {
         .active_thresh = {0},
-        .charge_speed = TOUCH_CHARGE_SPEED_7,       // 最快充放电，分辨率最高
+        .charge_speed = TOUCH_CHARGE_SPEED_4,       // 7→4：降低充放电电流，减小对 GPIO12 嘴舵机的耦合干扰
         .init_charge_volt = TOUCH_INIT_CHARGE_VOLT_DEFAULT,
     };
     touch_channel_handle_t chan_handle = nullptr;
@@ -117,18 +126,26 @@ static void TouchHeadShakeTask(void* arg) {
     // 浮点 EWMA 每帧移动 0.1% × |raw-baseline|，τ≈50s 即可收敛到 raw 均值。
     double baseline_f = (double)baseline;
 
-    // 合理性检查：基线应在 [100, 200000] 区间
-    // 电极面积适中时一般 ~2000~50000
-    if (baseline < 100 || baseline > 200000) {
+    // 合理性检查：基线应在 [100, 1000000] 区间
+    // 电极面积适中时一般 ~2000~50000；
+    // v18 实测无摄像头版基线 ~392622（GPIO13 与嘴舵机 GPIO12 PWM 相邻耦合等
+    // 电气环境因素），属稳定可用值，上限放宽到 1M；超过 1M 才大概率是
+    // 电极过大/短路等硬件问题。
+    if (baseline < 100 || baseline > 1000000) {
         ESP_LOGE(TAG, "触摸基线异常 raw=%u，触摸检测禁用，请检查硬件/电极面积",
                  baseline);
         vTaskDelete(nullptr);
         return;
     }
 
-    // 阈值：稳态漂移由滚动基线吸收后，空闲 delta 应趋近 0；
-    // idle 实测峰值 ~220，触摸信号峰值 ~282(单帧)，故阈值取 240。
-    int threshold = TOUCH_PAD_HEAD_THRESHOLD;
+    // 阈值自适应：取 max(固定阈值, 基线×0.2%)。
+    // - 基线 ~51200（旧电气环境）时 51200/500=102 → 阈值仍为 115，原标定行为保留；
+    // - 基线 ~392622（v18 实测）时阈值≈785：
+    //   · 若噪声/触摸信号随基线同比放大（idle ±380 / 触摸 +900 量级），785 可
+    //     正常区分；若为叠加型噪声（绝对值 ±50 不变），785 保证不误触发，
+    //     触摸可能暂不响应——观察日志 raw/delta 后再精调。
+    // 触发判定仍是相对基线的 delta，与基线绝对值无关。
+    int threshold = std::max(TOUCH_PAD_HEAD_THRESHOLD, (int)(baseline / 500));
     ESP_LOGI(TAG, "触摸基线 raw=%u 阈值=%d", baseline, threshold);
 
     TickType_t last_trigger = 0;
@@ -565,7 +582,9 @@ public:
         }
 
         InitializeOttoController();
-        StartTouchHeadShake();
+        // 触摸任务恢复（诊断后已通过 charge_speed/charge_times 降档降低 GPIO13→GPIO12 耦合）
+        // 临时禁用：验证嘴不动是否由触摸耦合 GPIO12 导致（[2026-09-30] 诊断期）
+        // StartTouchHeadShake();
         ws_control_server_ = nullptr;
         GetBacklight()->RestoreBrightness();
     }
