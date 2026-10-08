@@ -148,21 +148,28 @@ constexpr HardwareConfig NON_CAMERA_VERSION_CONFIG = {
 #define CAMERA_D1 (GPIO_NUM_14)
 #define CAMERA_D2 (GPIO_NUM_21)
 
-// 鸭头触摸电极：GPIO13 → TOUCH_PAD_NUM12（T12）
-// 注意：TOUCH_PAD_NUM0（GPIO1）是 ESP32-S3 内部去噪通道，禁止作为触摸传感使用
-// 无摄像头版 config 中 GPIO13 无任何占用，且不是 strapping pin
-#define TOUCH_PAD_HEAD_GPIO      GPIO_NUM_13
-// 阈值选择：基线 = 启动 idle 均值（约 51200）。
-// - idle delta 在 ±50 噪声内（基线不动 + raw 围绕 idle 均值波动）
-// - 触摸曲线：idle +119 → +119 → +119 → +150 → 释放
-//   （注意：触摸峰值只 1 帧 =150；阈值必须 ≤ 触摸曲线第二帧 delta=119
-//    才能让 over_cnt=2 帧连续累计）
-// - 阈值 115：触摸 119、150 两帧连续 > 115 → 触发
-//              idle 偶发 delta=+60~+80 < 115，余量 35+
-// （v5=110 时偶发误触，上调到 115 略收紧）
-// 注意：v18 起实际阈值 = max(本值, 基线×0.2%)（见 microduck_xiaozhi.cc），
-// 基线 ~392622 时阈值≈785；本值仅作为低基线（<57500）时的固定下限。
-#define TOUCH_PAD_HEAD_THRESHOLD 115
+// 鸭头触摸电极：GPIO2 → TOUCH_PAD_NUM2（T2）
+// 硬件：薄铜片电极，2cm × 1.45cm。
+// 迁移原因：原 GPIO13（TOUCH_PAD_NUM12）紧邻嘴舵机 PWM GPIO12，
+//   触摸扫描的充放电噪声会耦合进 PWM 信号线导致嘴舵机抖动。
+//   GPIO2 与所有舵机引脚（GPIO8/12/17/18/38/39）相距足够远，隔离性好。
+// 无摄像头版 config 中 GPIO2 无任何占用，且不是 strapping pin，
+//   可安全用作外部触摸电极。
+// 注意：TOUCH_PAD_NUM0（GPIO1）是 ESP32-S3 内部去噪通道，禁止使用。
+#define TOUCH_PAD_HEAD_GPIO      GPIO_NUM_2
+// 阈值选择：
+// - 电极 2x1.45cm（~2.9cm²），实测无摄像头版基线 ~66336，
+//   idle delta 在 +130~±150% / -300~-500 噪声区间漂移。
+// - 真实手指接触铜片实测 delta≈+7220（远距离手指靠近 +50~+150）。
+// - 固定下限 5000 + 自适应公式 max(5000, baseline/300)：
+//   · baseline=66336 时阈值 = max(5000, 221) = 5000；
+//     idle delta ±180~+150 留 100x 余量；real touch delta +7220 > 5000 触发。
+//   · 远距离手指靠近 delta +50~+150 < 5000，不会误触。
+//   · 小基线场景（baseline=2500）→ 阈值 5000，仍能正常识别真实触摸。
+// 历史参考：
+//   GPIO13 + 大电极 → 基线 ~51200 → 阈值 115 → 触摸 +280 触发
+//   GPIO2  + 小电极 → 基线 ~66336 → 阈值 5000 → 触摸 +7220 触发
+#define TOUCH_PAD_HEAD_THRESHOLD 5000
 #define TOUCH_PAD_HEAD_DEBOUNCE_MS 3000 // 两次触摸间的最小间隔，避免抖动
 // 长基线跟踪：每帧 baseline 向 raw 移动 1/1024，约 50s 时间常数（τ）。
 // 慢基线跟踪：每帧移动 1/4096，约 200s 时间常数，仅在 idle 怀疑有漂移时启用。
