@@ -16,9 +16,11 @@
 #include "config.h"
 #include "display/lcd_display.h"
 #include "esp32_camera.h"
+#include "feature_weather_clock.h"
 #include "lamp_controller.h"
 #include "led/single_led.h"
 #include "mcp_server.h"
+#include "mode_manager.h"
 #include "otto_emoji_display.h"
 #include "power_manager.h"
 #include "system_reset.h"
@@ -36,16 +38,20 @@ extern void InitializeOttoController(const HardwareConfig& hw_config);
 extern void OttoQueueAction(int action_type, int steps, int speed,
                             int direction, int amount);
 
-// 触摸任务：GPIO2（TOUCH_PAD_NUM2）检测到触摸 → 投递 ACTION_DUCK_SHAKE_HEAD
+// 触摸任务：GPIO2（TOUCH_PAD_NUM2）检测到触摸 → 投递事件给 ModeManager
+//
+// 行为：
+// 1. 短按（<1500ms）：对话模式 → 进入子菜单第一个功能；
+//                    子菜单内 → NextFeature() 切换下一个功能
+// 2. 长按（>=1500ms）：仅在子菜单中触发 → 退出回对话模式
+// 3. 切换瞬间播放点头 2 次作为反馈（脖点头 2 次 + 嘴不动）
 //
 // 关键点：
 // 1. 启动后必须等待 3 秒再测基线：舵机/WiFi/音频等外设上电后会改变触摸传感器的
 //    电气环境，启动期的读数不能代表稳态基线。
-// 2. 无条件滚动基线：始终缓慢跟踪当前 SMOOTH 值以吸收温漂/上电漂移；
-//    超过阈值时改用更慢的比率，既不影响一次 1~2 秒的真实触摸，又能吸收持续性漂移。
-// 3. 边沿触发：只有"回落到阈值以下重新武装"后才允许再次触发，
-//    避免环境长期偏移导致每 3 秒重复触发。
-// 4. 3 帧连续确认 + 3 秒冷却窗口，防止单点噪声误触发。
+// 2. 无条件滚动基线：始终缓慢跟踪当前 SMOOTH 值以吸收温漂/上电漂移。
+// 3. 边沿触发：只有"回落到阈值以下重新武装"后才允许再次触发。
+// 4. 4 帧连续确认 + 3 秒冷却窗口，防止单点噪声误触发。
 static void TouchHeadShakeTask(void* arg) {
     // ---- 新驱动（touch_sens.h, ESP32-S3 = Touch HW V2）初始化 ----
     // 采样配置：电极尺寸 2cm × 1.45cm（小电极），使用默认 charge_speed=7、
@@ -142,13 +148,14 @@ static void TouchHeadShakeTask(void* arg) {
     TickType_t last_trigger = 0;
     int debug_count = 0;      // 调试：每 20×50ms = 1s 打印一次 raw/delta/baseline
     int baseline_log = 0;     // 调试：每 200×50ms = 10s 打印一次 baseline 变化确认跟踪生效
-    int over_cnt = 0;         // 连续超阈值帧计数，避免单点噪声触发
+    int over_cnt = 0;         // 连续超阈值帧计数
     bool armed = true;        // 边沿锁存：触发后置 false，仅 cooldown 结束后置 true
+    bool pressing = false;    // 当前是否处于"按住中"状态（已触发短按事件，等待升级长按或松开）
+    int long_press_fired = 0; // 防止同一按住过程中重复触发长按
     while (true) {
         // SMOOTH 值：驱动内置 IIR 滤波，比 RAW 平滑
         touch_channel_read_data(chan_handle, TOUCH_CHAN_DATA_TYPE_SMOOTH, &raw);
         const int delta = (int)raw - (int)baseline;
-        const int adelta = delta < 0 ? -delta : delta;
         if (++debug_count >= 20) {
             ESP_LOGI(TAG, "raw=%u delta=%d baseline=%u", raw, delta, baseline);
             debug_count = 0;
@@ -165,27 +172,71 @@ static void TouchHeadShakeTask(void* arg) {
             (now - last_trigger) < pdMS_TO_TICKS(TOUCH_PAD_HEAD_DEBOUNCE_MS);
 
         if (delta > threshold) {
-            // ★ 仅正向触发（raw > baseline）。
-            // 触摸电极增加电容 → raw 增大；raw < baseline 是环境漂移或基线跟踪滞后，
-            // 不应触发摇头。
-            // 阈值 240 + 4 帧确认（200ms）：idle 噪声 < 240 不触发；
-            // real touch delta +300~+500 持续 > 200ms 触发。
-            if (armed && !in_cooldown) {
-                if (++over_cnt >= 4) {  // 连续 4 帧确认（约 200ms）
-                    ESP_LOGI(TAG, "触摸检测 delta=%d 触发摇头", delta);
-                    // 52 = ACTION_DUCK_SHAKE_HEAD，4 步振荡、1.0s 周期、0 居中、30° 幅度
-                    OttoQueueAction(52, 4, 1000, 0, 30);
+            if (armed && !in_cooldown && !pressing) {
+                // 新一次按下的开始：先按住观察，按下立即进入"按住中"状态，
+                // 不立即触发任何事件，等松开再判定是短按还是长按。
+                over_cnt = 1;
+                pressing = true;
+                long_press_fired = 0;
+                ESP_LOGI(TAG, "触摸检测 delta=%d 按下", delta);
+            } else if (pressing) {
+                over_cnt++;
+                // 长按判定：按住 ≥kTouchLongPressMs ms 后立即触发长按事件
+                // 轮询周期 50ms，所以帧数 = kTouchLongPressMs / 50
+                if (over_cnt * 50 >= ModeManager::kTouchLongPressMs &&
+                    !long_press_fired) {
+                    long_press_fired = 1;
+                    auto& mgr = ModeManager::GetInstance();
+                    if (mgr.InSubMenu()) {
+                        ESP_LOGI(TAG, "长按：退出子菜单");
+                        // 先入队反馈动作，再退出子菜单：
+                        // OttoController 在独立任务中按 FIFO 处理队列，
+                        // 入队先意味着脖摇动作的"开始时刻"早于 DeleteLabels 清理屏幕，
+                        // 用户能感知到"长按已被识别→立即反馈动作→屏幕退出"的连贯节奏。
+                        OttoQueueAction(52, 2, 600, 0, 25);  // 脖左右摇 2 次反馈
+                        mgr.ExitSubMenu();
+                    } else {
+                        ESP_LOGD(TAG, "对话模式长按，无操作");
+                    }
                     last_trigger = now;
-                    armed = false;
-                    over_cnt = 0;
                 }
             }
         } else {
-            over_cnt = 0;
-            // 关键：cooldown 期间即使 delta 回落到阈值以内，也保持 armed=false，
-            // 避免一次触摸动作执行期间被反复触发。仅 cooldown 结束后才重新武装。
-            if (!in_cooldown) {
-                armed = true;
+            // delta 回到阈值以下 → 视为"松开"
+            if (pressing) {
+                pressing = false;
+                const int held = over_cnt;
+                over_cnt = 0;
+
+                // 若按下期间未升级为长按，则视为短按 → 触发对应事件
+                if (!long_press_fired) {
+                    auto& mgr = ModeManager::GetInstance();
+                    if (mgr.InDialogue()) {
+                        if (mgr.FeatureCount() > 0) {
+                            ESP_LOGI(TAG, "短按（持续 %d 帧）：进入子菜单", held);
+                            // 先入队反馈动作，再切换状态。
+                            OttoQueueAction(52, 2, 600, 0, 25);  // 脖左右摇 2 次反馈
+                            mgr.EnterSubMenu(0);
+                        } else {
+                            ESP_LOGW(TAG, "短按：未注册任何子功能");
+                        }
+                    } else if (mgr.InSubMenu()) {
+                        ESP_LOGI(TAG, "短按（持续 %d 帧）：切换下一个子功能", held);
+                        OttoQueueAction(52, 2, 600, 0, 25);  // 脖左右摇 2 次反馈
+                        mgr.NextFeature();
+                    }
+                } else {
+                    ESP_LOGD(TAG, "长按后松开（按住 %d 帧）", held);
+                }
+                last_trigger = xTaskGetTickCount();
+                ESP_LOGD(TAG, "触摸松开");
+            } else {
+                over_cnt = 0;
+                // 关键：cooldown 期间即使 delta 回落到阈值以内，也保持 armed=false，
+                // 避免一次触摸动作执行期间被反复触发。仅 cooldown 结束后才重新武装。
+                if (!in_cooldown) {
+                    armed = true;
+                }
             }
         }
 
@@ -212,6 +263,18 @@ if (!in_cooldown && (int)raw < (int)baseline) {
 
 static void StartTouchHeadShake() {
     xTaskCreate(TouchHeadShakeTask, "touch_head", 2048, nullptr, 5, nullptr);
+}
+
+// 1Hz tick 任务：ModeManager::NotifyTick() 检查子菜单超时 + 转发 OnTick 给当前功能
+static void ModeManagerTickTask(void* arg) {
+    while (true) {
+        ModeManager::GetInstance().NotifyTick();
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+}
+
+static void StartModeManagerTick() {
+    xTaskCreate(ModeManagerTickTask, "mode_tick", 2048, nullptr, 3, nullptr);
 }
 
 class MicroduckXiaozhi : public WifiBoard {
@@ -578,6 +641,17 @@ public:
         InitializeOttoController();
         // 触摸任务：触摸电极已迁移到 GPIO2（与嘴舵机 GPIO12 隔离），重新启用
         StartTouchHeadShake();
+
+        // ★ 模式管理器：注册子功能模块
+        //   后续要新增功能（例如：音乐盒、相册、单词卡...），
+        //   只需在下面再加一行 mode_mgr.Register(std::make_unique<...>());
+        auto& mode_mgr = ModeManager::GetInstance();
+        mode_mgr.Register(std::make_unique<WeatherClockModule>());
+        // 启动 1Hz tick 任务（检查子菜单超时 + 转发 OnTick 给当前功能）
+        StartModeManagerTick();
+        // 上电固定从对话模式启动，不读历史 last_mode。
+        // 运行时仍由 NotifyTick 超时或长按切换回对话（自动保存到 NVS）。
+
         ws_control_server_ = nullptr;
         GetBacklight()->RestoreBrightness();
     }
